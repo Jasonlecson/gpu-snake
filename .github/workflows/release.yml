@@ -35,27 +35,8 @@ jobs:
           name: gpu_snake-macos-x86_64
           path: gpu_snake
 
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install MSYS2 and build
-        uses: msys2/setup-msys2@v2
-        with:
-          msystem: MINGW64
-          release: true
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-opencl-icd-loader mingw-w64-x86_64-pdcurses
-      - name: Build
-        shell: msys2 {0}
-        run: gcc -O2 -o gpu_snake.exe gpu_snake.c -lOpenCL -lpdcurses
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: gpu_snake-windows-x86_64
-          path: gpu_snake.exe
-
   release:
-    needs: [build-linux, build-macos, build-windows]
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -73,7 +54,7 @@ jobs:
             ### Downloads
             - `gpu_snake-linux-x86_64` - Linux x86_64
             - `gpu_snake-macos-x86_64` - macOS x86_64
-            - `gpu_snake-windows-x86_64.exe` - Windows x86_64
+            - Windows: build from source with MSYS2/MinGW (see README)
 
             ### Requirements
             - OpenCL runtime (install your GPU driver)
@@ -81,6 +62,5 @@ jobs:
           files: |
             artifacts/gpu_snake-linux-x86_64/gpu_snake
             artifacts/gpu_snake-macos-x86_64/gpu_snake
-            artifacts/gpu_snake-windows-x86_64/gpu_snake.exe
           draft: false
           prerelease: false
