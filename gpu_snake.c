@@ -299,9 +299,9 @@ static gpu_ctx_t gpu_init(void) {
 #ifdef CL_VERSION_2_0
     g.queue = clCreateCommandQueueWithProperties(g.ctx, g.device,
                 (cl_queue_properties[]){CL_QUEUE_PROFILING_ENABLE, 0}, &err);
-#else
-    g.queue = clCreateCommandQueue(g.ctx, g.device, CL_QUEUE_PROFILING_ENABLE, &err);
+    if (err != CL_SUCCESS)
 #endif
+    g.queue = clCreateCommandQueue(g.ctx, g.device, CL_QUEUE_PROFILING_ENABLE, &err);
     check_cl(err, "create queue");
 
     g.prog = clCreateProgramWithSource(g.ctx, 1, &KERNEL_SRC, NULL, &err);
