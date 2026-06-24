@@ -1,14 +1,35 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <time.h>
-#include <unistd.h>
-#include <sys/ioctl.h>
-#include <ncurses.h>
-#include <locale.h>
-#include <CL/cl.h>
+
+#ifdef _WIN32
+  #include <windows.h>
+  #include <conio.h>
+  #define USE_PDCURSES 1
+#else
+  #include <unistd.h>
+  #include <sys/ioctl.h>
+  #include <locale.h>
+  #define USE_NCURSES 1
+#endif
+
+#ifdef USE_PDCURSES
+  #include <curses.h>
+#else
+  #include <ncurses.h>
+#endif
+
+#ifdef __APPLE__
+  #include <OpenCL/opencl.h>
+#else
+  #include <CL/cl.h>
+#endif
 
 #define FOOD_COUNT 10
+
+/* ======================== OpenCL kernel ======================== */
 
 static const char *KERNEL_SRC =
 "__kernel void snake_update(\n"
@@ -53,6 +74,40 @@ static const char *KERNEL_SRC =
 "    }\n"
 "}\n";
 
+/* ======================== Platform abstraction ======================== */
+
+static double now_us(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq = {0};
+    LARGE_INTEGER cnt;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&cnt);
+    return (double)cnt.QuadPart / freq.QuadPart * 1e6;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+#endif
+}
+
+static void get_terminal_size(int *w, int *h) {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info);
+    *w = info.srWindow.Right - info.srWindow.Left + 1;
+    *h = info.srWindow.Bottom - info.srWindow.Top + 1;
+#else
+    struct winsize ws;
+    ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
+    *w = ws.ws_col;
+    *h = ws.ws_row;
+#endif
+    if (*w < 20) *w = 20;
+    if (*h < 10) *h = 10;
+}
+
+/* ======================== GPU context ======================== */
+
 typedef struct {
     cl_platform_id platform;
     cl_device_id device;
@@ -67,18 +122,6 @@ typedef struct {
     int clock_freq;
     int is_gpu;
 } gpu_ctx_t;
-
-typedef struct {
-    int grid_w, grid_h;
-    int map_h;
-    int info_y;
-} layout_t;
-
-static double now_us(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
-}
 
 static void check_cl(cl_int err, const char *msg) {
     if (err != CL_SUCCESS) {
@@ -96,35 +139,34 @@ static gpu_ctx_t gpu_init(void) {
     err = clGetPlatformIDs(0, NULL, &num_platforms);
     if (err != CL_SUCCESS || num_platforms == 0) {
         endwin();
-        fprintf(stderr, "No OpenCL platforms found\n");
+        fprintf(stderr, "No OpenCL platforms found.\n");
+        fprintf(stderr, "Install an OpenCL runtime:\n");
+        fprintf(stderr, "  Linux:   sudo apt install mesa-opencl-icd (AMD/Intel) or nvidia-opencl-icd (NVIDIA)\n");
+        fprintf(stderr, "  macOS:   built-in (deprecated but functional)\n");
+        fprintf(stderr, "  Windows: install GPU driver (NVIDIA/AMD/Intel provides OpenCL)\n");
         exit(1);
     }
 
     cl_platform_id *platforms = malloc(num_platforms * sizeof(cl_platform_id));
     clGetPlatformIDs(num_platforms, platforms, NULL);
 
-    // try GPU first, then any device
     g.device = NULL;
     for (cl_uint p = 0; p < num_platforms && !g.device; p++) {
-        cl_uint num_devs;
-        if (clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, 0, NULL, &num_devs) == CL_SUCCESS && num_devs > 0) {
-            cl_device_id *devs = malloc(num_devs * sizeof(cl_device_id));
-            clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, num_devs, devs, NULL);
-            g.device = devs[0];
-            g.platform = platforms[p];
-            g.is_gpu = 1;
+        cl_uint nd;
+        if (clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, 0, NULL, &nd) == CL_SUCCESS && nd > 0) {
+            cl_device_id *devs = malloc(nd * sizeof(cl_device_id));
+            clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_GPU, nd, devs, NULL);
+            g.device = devs[0]; g.platform = platforms[p]; g.is_gpu = 1;
             free(devs);
         }
     }
     if (!g.device) {
         for (cl_uint p = 0; p < num_platforms && !g.device; p++) {
-            cl_uint num_devs;
-            if (clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_ALL, 0, NULL, &num_devs) == CL_SUCCESS && num_devs > 0) {
-                cl_device_id *devs = malloc(num_devs * sizeof(cl_device_id));
-                clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_ALL, num_devs, devs, NULL);
-                g.device = devs[0];
-                g.platform = platforms[p];
-                g.is_gpu = 0;
+            cl_uint nd;
+            if (clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_ALL, 0, NULL, &nd) == CL_SUCCESS && nd > 0) {
+                cl_device_id *devs = malloc(nd * sizeof(cl_device_id));
+                clGetDeviceIDs(platforms[p], CL_DEVICE_TYPE_ALL, nd, devs, NULL);
+                g.device = devs[0]; g.platform = platforms[p]; g.is_gpu = 0;
                 free(devs);
             }
         }
@@ -143,12 +185,17 @@ static gpu_ctx_t gpu_init(void) {
     clGetDeviceInfo(g.device, CL_DEVICE_MAX_CLOCK_FREQUENCY, sizeof(int), &g.clock_freq, NULL);
 
     g.ctx = clCreateContext(NULL, 1, &g.device, NULL, NULL, &err);
-    check_cl(err, "ctx");
+    check_cl(err, "create context");
+#ifdef CL_VERSION_2_0
+    g.queue = clCreateCommandQueueWithProperties(g.ctx, g.device,
+                (cl_queue_properties[]){CL_QUEUE_PROFILING_ENABLE, 0}, &err);
+#else
     g.queue = clCreateCommandQueue(g.ctx, g.device, CL_QUEUE_PROFILING_ENABLE, &err);
-    check_cl(err, "queue");
+#endif
+    check_cl(err, "create queue");
 
     g.prog = clCreateProgramWithSource(g.ctx, 1, &KERNEL_SRC, NULL, &err);
-    check_cl(err, "prog");
+    check_cl(err, "create program");
     err = clBuildProgram(g.prog, 1, &g.device, NULL, NULL, NULL);
     if (err != CL_SUCCESS) {
         size_t log_sz;
@@ -156,13 +203,13 @@ static gpu_ctx_t gpu_init(void) {
         char *log = malloc(log_sz);
         clGetProgramBuildInfo(g.prog, g.device, CL_PROGRAM_BUILD_LOG, log_sz, log, NULL);
         endwin();
-        fprintf(stderr, "Build:\n%s\n", log);
+        fprintf(stderr, "OpenCL build error:\n%s\n", log);
         free(log);
         exit(1);
     }
 
     g.kernel = clCreateKernel(g.prog, "snake_update", &err);
-    check_cl(err, "kernel");
+    check_cl(err, "create kernel");
     return g;
 }
 
@@ -179,8 +226,8 @@ static void gpu_alloc(gpu_ctx_t *g, int w, int h, int *grid) {
 
 static void gpu_upload(gpu_ctx_t *g, int *grid, int *head, int *dir, int *len,
                        int *status, int *rng, int w, int h) {
-    clEnqueueWriteBuffer(g->queue, g->grid_g, CL_TRUE, 0, w * h * sizeof(int), grid, 0, NULL, NULL);
-    clEnqueueWriteBuffer(g->queue, g->head_g, CL_TRUE, 0, 2 * sizeof(int), head, 0, NULL, NULL);
+    clEnqueueWriteBuffer(g->queue, g->grid_g, CL_TRUE, 0, w*h*sizeof(int), grid, 0, NULL, NULL);
+    clEnqueueWriteBuffer(g->queue, g->head_g, CL_TRUE, 0, 2*sizeof(int), head, 0, NULL, NULL);
     clEnqueueWriteBuffer(g->queue, g->dir_g, CL_TRUE, 0, sizeof(int), dir, 0, NULL, NULL);
     clEnqueueWriteBuffer(g->queue, g->len_g, CL_TRUE, 0, sizeof(int), len, 0, NULL, NULL);
     clEnqueueWriteBuffer(g->queue, g->status_g, CL_TRUE, 0, sizeof(int), status, 0, NULL, NULL);
@@ -197,14 +244,17 @@ static void gpu_free(gpu_ctx_t *g) {
     clReleaseContext(g->ctx);
 }
 
-static void calc_layout(layout_t *l) {
-    struct winsize ws;
-    ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws);
-    int sw = ws.ws_col;
-    int sh = ws.ws_row;
-    if (sw < 20) sw = 20;
-    if (sh < 10) sh = 10;
+/* ======================== Layout ======================== */
 
+typedef struct {
+    int grid_w, grid_h;
+    int map_h;
+    int info_y;
+} layout_t;
+
+static void calc_layout(layout_t *l) {
+    int sw, sh;
+    get_terminal_size(&sw, &sh);
     int info = sh / 4;
     if (info < 8) info = 8;
     l->info_y = sh - info;
@@ -214,6 +264,8 @@ static void calc_layout(layout_t *l) {
     if (l->grid_w < 5) l->grid_w = 5;
     if (l->grid_h < 3) l->grid_h = 3;
 }
+
+/* ======================== Game ======================== */
 
 static void init_game(int *grid, int *head, int *dir, int *len, int *status,
                       int *rng, int w, int h) {
@@ -232,8 +284,28 @@ static void init_game(int *grid, int *head, int *dir, int *len, int *status,
     }
 }
 
+static void print_line(int y, const char *s) {
+    mvaddstr(y, 0, s);
+}
+
+static void print_linef(int y, const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    mvaddstr(y, 0, buf);
+}
+
+/* ======================== Main ======================== */
+
 int main(void) {
-    srand(time(NULL));
+    srand((unsigned)time(NULL));
+
+#ifdef USE_NCURSES
+    setlocale(LC_ALL, "");
+#endif
+
     gpu_ctx_t gpu = gpu_init();
     layout_t lay;
     calc_layout(&lay);
@@ -245,7 +317,6 @@ int main(void) {
     gpu_alloc(&gpu, gw, gh, grid);
     gpu_upload(&gpu, grid, head, dir, len, status, rng, gw, gh);
 
-    setlocale(LC_ALL, "");
     initscr(); cbreak(); noecho(); curs_set(0);
     nodelay(stdscr, TRUE); timeout(80); keypad(stdscr, TRUE);
     start_color(); use_default_colors();
@@ -255,7 +326,6 @@ int main(void) {
     init_pair(4, COLOR_WHITE, -1);
     init_pair(5, COLOR_CYAN, -1);
     init_pair(6, COLOR_MAGENTA, -1);
-    init_pair(7, COLOR_BLUE, -1);
 
     double t_sum = 0;
     int fc = 0;
@@ -274,24 +344,18 @@ int main(void) {
             case 'r': goto restart;
         }
 
-        // resize check
         layout_t nl;
         calc_layout(&nl);
         if (nl.grid_w != gw || nl.grid_h != gh) {
             int old_w = gw, old_h = gh;
-            gw = nl.grid_w; gh = nl.grid_h;
-            lay = nl;
+            gw = nl.grid_w; gh = nl.grid_h; lay = nl;
             int *ng = calloc(gw * gh, sizeof(int));
-            // copy old grid content
             for (int y = 0; y < (gh < old_h ? gh : old_h); y++)
                 for (int x = 0; x < (gw < old_w ? gw : old_w); x++)
                     ng[y * gw + x] = grid[y * old_w + x];
-            free(grid);
-            grid = ng;
-            // clamp head
+            free(grid); grid = ng;
             if (head[0] >= gh) head[0] = gh - 1;
             if (head[1] >= gw) head[1] = gw - 1;
-            // realloc GPU buffers
             clReleaseMemObject(gpu.grid_g);
             cl_int err;
             gpu.grid_g = clCreateBuffer(gpu.ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
@@ -299,12 +363,10 @@ int main(void) {
             fc = 0; t_sum = 0; sess = now_us();
         }
 
-        // dir copy
         clEnqueueWriteBuffer(gpu.queue, gpu.dir_g, CL_TRUE, 0, sizeof(int), dir, 0, NULL, NULL);
 
-        // kernel
         double t0 = now_us();
-        size_t gws = gw * gh;
+        size_t gws = (size_t)gw * gh;
         cl_event ev;
         clSetKernelArg(gpu.kernel, 0, sizeof(cl_mem), &gpu.grid_g);
         clSetKernelArg(gpu.kernel, 1, sizeof(cl_mem), &gpu.head_g);
@@ -318,7 +380,6 @@ int main(void) {
         clFinish(gpu.queue);
         double t_kernel = now_us() - t0;
 
-        // read back
         t0 = now_us();
         clEnqueueReadBuffer(gpu.queue, gpu.head_g, CL_TRUE, 0, 2*sizeof(int), head, 0, NULL, NULL);
         clEnqueueReadBuffer(gpu.queue, gpu.status_g, CL_TRUE, 0, sizeof(int), status, 0, NULL, NULL);
@@ -326,7 +387,6 @@ int main(void) {
         clEnqueueReadBuffer(gpu.queue, gpu.grid_g, CL_TRUE, 0, gw*gh*sizeof(int), grid, 0, NULL, NULL);
         double t_rb = now_us() - t0;
 
-        // GPU profiling
         cl_ulong ps, pt, pe;
         clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_SUBMIT, sizeof(ps), &ps, NULL);
         clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(pt), &pt, NULL);
@@ -338,19 +398,16 @@ int main(void) {
         fc++;
         t_sum += t_kernel;
 
-        // render
         erase();
         attron(A_BOLD | COLOR_PAIR(6));
-        mvprintw(0, 0, " GPU SNAKE %dx%d=%d cells | %s %s %dCU@%dMHz ",
-                 gw, gh, gw * gh,
-                 gpu.platform_name, gpu.device_name, gpu.compute_units, gpu.clock_freq);
-        int title_len = 40 + strlen(gpu.platform_name) + strlen(gpu.device_name);
-        for (int i = title_len; i < lay.grid_w + 2; i++) addch(' ');
+        print_linef(0, " GPU SNAKE %dx%d=%d cells | %s %s %dCU@%dMHz ",
+                    gw, gh, gw * gh,
+                    gpu.platform_name, gpu.device_name, gpu.compute_units, gpu.clock_freq);
         attroff(A_BOLD | COLOR_PAIR(6));
 
         for (int y = 0; y < gh; y++) {
             move(y + 1, 0);
-            for (int x = 0; x < gw && x < lay.grid_w; x++) {
+            for (int x = 0; x < gw; x++) {
                 int v = grid[y * gw + x];
                 int c, a;
                 if (y == head[0] && x == head[1]) {
@@ -366,53 +423,42 @@ int main(void) {
             }
         }
 
-        // info
         int iy = lay.info_y;
         double elapsed = (now_us() - sess) / 1e6;
         double fps = fc / elapsed;
         double avg = t_sum / fc;
         double frame_us = now_us() - tf;
-        char buf[512];
 
         attron(COLOR_PAIR(4) | A_BOLD);
-        snprintf(buf, sizeof(buf), " Score:%d  Length:%d  Frame:%d  Pos(%d,%d)  FPS:%.1f",
-                 len[0]-4, len[0], fc, head[1], head[0], fps);
-        mvaddstr(iy++, 0, buf);
+        print_linef(iy++, " Score:%d  Length:%d  Frame:%d  Pos(%d,%d)  FPS:%.1f",
+                    len[0]-4, len[0], fc, head[1], head[0], fps);
         attroff(COLOR_PAIR(4) | A_BOLD);
 
         iy++;
         attron(COLOR_PAIR(5));
-        mvaddstr(iy++, 0, " \xe2\x94\x80\xe2\x94\x80 GPU \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80");
-        snprintf(buf, sizeof(buf), "  Platform:   %s", gpu.platform_name);
-        mvaddstr(iy++, 0, buf);
-        snprintf(buf, sizeof(buf), "  Device:     %s  (%s)", gpu.device_name, gpu.is_gpu ? "GPU" : "CPU/Other");
-        mvaddstr(iy++, 0, buf);
-        snprintf(buf, sizeof(buf), "  CUs: %d  Freq: %d MHz  Grid: %dx%d  Threads: %d",
-                 gpu.compute_units, gpu.clock_freq, gw, gh, gw * gh);
-        mvaddstr(iy++, 0, buf);
+        print_line(iy++, " -- GPU -----------------------------------------------------");
+        print_linef(iy++, "  Platform:   %s", gpu.platform_name);
+        print_linef(iy++, "  Device:     %s  (%s)", gpu.device_name, gpu.is_gpu ? "GPU" : "CPU");
+        print_linef(iy++, "  CUs: %d  Freq: %d MHz  Grid: %dx%d  Threads: %d",
+                    gpu.compute_units, gpu.clock_freq, gw, gh, gw * gh);
         iy++;
-        snprintf(buf, sizeof(buf), " \xe2\x94\x80\xe2\x94\x80 Timing (avg %d frames) \xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80", fc);
-        mvaddstr(iy++, 0, buf);
-        snprintf(buf, sizeof(buf), "  Kernel exec:  %8.1f us  (GPU hw: %7.1f us, queue: %7.1f us)",
-                 avg, gpu_k, gpu_q);
-        mvaddstr(iy++, 0, buf);
-        snprintf(buf, sizeof(buf), "  Result copy:  %8.1f us", t_rb);
-        mvaddstr(iy++, 0, buf);
-        snprintf(buf, sizeof(buf), "  Frame total:  %8.1f us  |  %.1f fps", frame_us, 1e6 / frame_us);
-        mvaddstr(iy++, 0, buf);
+        print_linef(iy++, " -- Timing (avg %d frames) -----------------------------------", fc);
+        print_linef(iy++, "  Kernel exec:  %8.1f us  (GPU hw: %7.1f us, queue: %7.1f us)",
+                    avg, gpu_k, gpu_q);
+        print_linef(iy++, "  Result copy:  %8.1f us", t_rb);
+        print_linef(iy++, "  Frame total:  %8.1f us  |  %.1f fps", frame_us, 1e6 / frame_us);
         attroff(COLOR_PAIR(5));
 
         iy++;
         attron(COLOR_PAIR(4));
-        snprintf(buf, sizeof(buf), " Arrows=move  q=quit  r=restart  |  Terminal=Grid %dx%d", gw, gh);
-        mvaddstr(iy++, 0, buf);
+        print_linef(iy++, " Arrows=move  q=quit  r=restart  |  Grid %dx%d on GPU", gw, gh);
         attroff(COLOR_PAIR(4));
 
         if (status[0] == 2) {
-            attron(A_BOLD | A_BLINK | COLOR_PAIR(2));
-            mvaddstr(iy + 1, 0, " GAME OVER! ");
-            attroff(A_BOLD | A_BLINK | COLOR_PAIR(2));
-            mvaddstr(iy + 2, 0, " r=restart  q=quit");
+            attron(A_BOLD | COLOR_PAIR(2));
+            print_line(iy + 1, " GAME OVER! ");
+            attroff(A_BOLD | COLOR_PAIR(2));
+            print_line(iy + 2, " r=restart  q=quit");
         }
 
         refresh();
