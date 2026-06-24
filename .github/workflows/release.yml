@@ -16,24 +16,24 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y libncurses-dev ocl-icd-opencl-dev opencl-headers
       - name: Build
-        run: gcc -O2 -o gpu_snake gpu_snake.c -lOpenCL -lncursesw -lm
+        run: gcc -O2 -o gpu_snake-linux-x86_64 gpu_snake.c -lOpenCL -lncursesw -lm
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: gpu_snake-linux-x86_64
-          path: gpu_snake
+          path: gpu_snake-linux-x86_64
 
   build-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Build
-        run: gcc -O2 -o gpu_snake gpu_snake.c -framework OpenCL -lncurses
+        run: gcc -O2 -o gpu_snake-macos-x86_64 gpu_snake.c -framework OpenCL -lncurses
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: gpu_snake-macos-x86_64
-          path: gpu_snake
+          path: gpu_snake-macos-x86_64
 
   release:
     needs: [build-linux, build-macos]
@@ -42,6 +42,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -60,7 +63,7 @@ jobs:
             - OpenCL runtime (install your GPU driver)
             - Terminal with UTF-8 support
           files: |
-            artifacts/gpu_snake-linux-x86_64/gpu_snake
-            artifacts/gpu_snake-macos-x86_64/gpu_snake
+            artifacts/gpu_snake-linux-x86_64/gpu_snake-linux-x86_64
+            artifacts/gpu_snake-macos-x86_64/gpu_snake-macos-x86_64
           draft: false
           prerelease: false
