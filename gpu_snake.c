@@ -7,19 +7,13 @@
 #ifdef _WIN32
   #include <windows.h>
   #include <conio.h>
-  #define USE_PDCURSES 1
 #else
   #include <unistd.h>
   #include <sys/ioctl.h>
   #include <locale.h>
-  #define USE_NCURSES 1
 #endif
 
-#ifdef USE_PDCURSES
-  #include <curses.h>
-#else
-  #include <ncurses.h>
-#endif
+#include <ncurses.h>
 
 #ifdef __APPLE__
   #include <OpenCL/opencl.h>
@@ -302,10 +296,7 @@ static void print_linef(int y, const char *fmt, ...) {
 int main(void) {
     srand((unsigned)time(NULL));
 
-#ifdef USE_NCURSES
     setlocale(LC_ALL, "");
-#endif
-
     gpu_ctx_t gpu = gpu_init();
     layout_t lay;
     calc_layout(&lay);

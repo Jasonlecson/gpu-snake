@@ -47,9 +47,9 @@ jobs:
         with:
           msystem: MINGW64
           release: true
-          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-opencl-icd mingw-w64-x86_64-opencl-headers mingw-w64-x86_64-pdcurses
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-opencl-icd mingw-w64-x86_64-opencl-headers mingw-w64-x86_64-ncurses
       - name: Build
-        run: gcc -O2 -o gpu_snake-windows-x86_64.exe gpu_snake.c -lOpenCL -lpdcurses
+        run: gcc -O2 -o gpu_snake-windows-x86_64.exe gpu_snake.c -lOpenCL -lncurses
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
