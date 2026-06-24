@@ -1,123 +1,126 @@
 # GPU Snake
 
-A snake game where the game logic runs entirely on the GPU via OpenCL. The grid size adapts to your terminal dimensions.
+贪吃蛇游戏，核心逻辑在 GPU 上通过 OpenCL 并行执行。网格大小自适应终端窗口。
 
-## Features
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-- Game state update (snake movement, collision detection, food spawning) runs on GPU
-- Terminal-adaptive grid size (terminal width x height = grid size)
-- Real-time GPU performance metrics (kernel execution time, queue delay, throughput)
-- Auto-detects GPU across all OpenCL platforms (AMD, NVIDIA, Intel, etc.)
-- **Cross-platform**: Linux, macOS, Windows
+## 功能
 
-## Requirements
+- **GPU 计算** — 蛇的移动、碰撞检测、食物生成全部在 GPU 上并行执行
+- **自适应网格** — 终端多大，格子就是多少
+- **实时性能指标** — 显示 GPU kernel 执行时间、队列延迟、FPS 等
+- **跨平台** — Linux、macOS 使用 ncurses，Windows 使用原生 Console API
+- **零依赖** — Windows 版单个 exe，不需要任何 DLL
 
-- OpenCL runtime
-- ncurses (Linux/macOS) or pdcurses (Windows)
-- C compiler (gcc, clang, or MSVC)
+## 下载
 
-### Linux (Debian/Ubuntu)
+从 [Releases](https://github.com/Jasonlecson/gpu-snake/releases) 下载对应平台的二进制文件：
+
+| 平台 | 文件 | 说明 |
+|------|------|------|
+| Linux x86_64 | `gpu_snake-linux-x86_64` | `chmod +x` 后直接运行 |
+| macOS x86_64 | `gpu_snake-macos-x86_64` | `chmod +x` 后直接运行 |
+| Windows x86_64 | `gpu_snake-windows-x86_64.exe` | 双击或命令行运行 |
+
+**前置条件：** 系统需安装 GPU 驱动（AMD / NVIDIA / Intel），驱动自带 OpenCL 运行时。
+
+## 从源码编译
+
+### Linux
 
 ```bash
+# Debian/Ubuntu
 sudo apt install build-essential libncurses-dev ocl-icd-opencl-dev opencl-headers
-```
 
-### Linux (Fedora)
-
-```bash
+# Fedora
 sudo dnf install gcc ncurses-devel ocl-icd-devel opencl-headers
+
+# Arch
+sudo pacman -S gcc ncurses ocl-icd opencl-headers
+
+# 编译运行
+make
+./gpu_snake
 ```
 
-### Linux (Arch)
+如果遇到 GPU 权限问题：
 
 ```bash
-sudo pacman -S gcc ncurses ocl-icd opencl-headers
+sudo usermod -aG render $USER   # 重新登录生效
+# 或临时使用：
+sg render -c "./gpu_snake"
 ```
 
 ### macOS
 
 ```bash
-# OpenCL is built-in, ncurses is pre-installed
-# Just need Xcode command line tools
 xcode-select --install
-```
-
-### Windows (MSYS2/MinGW)
-
-```bash
-# Install MSYS2 from https://www.msys2.org
-# Then in MSYS2 MinGW64 shell:
-pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-opencl-icd-loader mingw-w64-x86_64-pdcurses
-```
-
-### Windows (Visual Studio)
-
-Install the OpenCL SDK from your GPU vendor (NVIDIA/AMD/Intel), then compile with:
-
-```cmd
-cl gpu_snake.c /I"path\to\opencl\include" /link OpenCL.lib pdcurses.lib
-```
-
-## Build & Run
-
-### Linux / macOS
-
-```bash
 make
 ./gpu_snake
 ```
 
-If you get permission errors accessing the GPU (Linux):
+### Windows
+
+使用 [MSYS2](https://www.msys2.org) 的 MinGW64 环境：
 
 ```bash
-sg render -c "./gpu_snake"
-```
-
-### Windows (MSYS2)
-
-```bash
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-opencl-icd mingw-w64-x86_64-opencl-headers
 make
 ./gpu_snake.exe
 ```
 
-### Manual compilation
+Windows 版使用原生 Console API，不依赖 ncurses，编译后为单个 exe。
 
-```bash
-# Linux
-gcc -O2 -o gpu_snake gpu_snake.c -lOpenCL -lncursesw -lm
+## 操作
 
-# macOS
-gcc -O2 -o gpu_snake gpu_snake.c -framework OpenCL -lncurses
+| 按键 | 功能 |
+|------|------|
+| 方向键 | 移动 |
+| `q` | 退出 |
+| `r` | 重新开始 |
 
-# Windows (MinGW)
-gcc -O2 -o gpu_snake.exe gpu_snake.c -lOpenCL -lpdcurses
+## 工作原理
+
+每帧，GPU 执行一个 kernel 并行处理所有格子：
+
+```
+┌─────────────────────────────────────────────────┐
+│  GPU Kernel (所有格子并行)                        │
+│                                                  │
+│  1. Aging    — 蛇身格子 age++，超龄变空           │
+│  2. barrier  — 同步，等待所有格子更新完毕          │
+│  3. Move     — 线程 0 计算蛇头新位置              │
+│  4. Collision — 检测撞墙/撞自己                   │
+│  5. Food     — 吃到食物则随机生成新食物            │
+└─────────────────────────────────────────────────┘
+         ↓
+    CPU 读回结果 → 终端渲染
 ```
 
-## Controls
+## GPU 自动检测
 
-- Arrow keys: move
-- `q`: quit
-- `r`: restart
+按以下顺序搜索 OpenCL 设备：
 
-## How It Works
+1. 遍历所有平台，优先使用 **GPU 设备**（AMD / NVIDIA / Intel）
+2. 找不到 GPU 则回退到任意 OpenCL 设备（如 pocl CPU）
 
-Each frame, the GPU runs a kernel that processes every cell in the grid in parallel:
+无需手动配置，有 OpenCL 运行时就能跑。
 
-1. **Aging**: All snake body cells increment their age, expired cells become empty
-2. **Movement**: Thread 0 calculates the new head position
-3. **Collision**: Checks wall and self-collision
-4. **Food**: If food is eaten, randomly spawns a new one
+## 项目结构
 
-The kernel uses `barrier(CLK_GLOBAL_MEM_FENCE)` to synchronize between the aging and movement phases.
+```
+gpu-snake-game/
+├── gpu_snake.c              # 源码（跨平台，含 OpenCL kernel）
+├── Makefile                 # 编译脚本（自动检测平台）
+├── LICENSE                  # MIT 许可证
+├── README.md
+├── .gitignore
+└── .github/
+    └── workflows/
+        └── release.yml      # GitHub Actions 自动构建三平台二进制
+```
 
-## GPU Auto-Detection
+## 许可证
 
-The game searches for OpenCL devices in this order:
-1. GPU devices on all platforms (AMD, NVIDIA, Intel, etc.)
-2. Any OpenCL device as fallback (e.g., pocl for CPU)
-
-No configuration needed - it works on any system with an OpenCL runtime.
-
-## License
-
-MIT
+[MIT](LICENSE)
