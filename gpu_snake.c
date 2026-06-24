@@ -13,7 +13,7 @@
   #include <locale.h>
 #endif
 
-#include <ncurses.h>
+#include <curses.h>
 
 #ifdef __APPLE__
   #include <OpenCL/opencl.h>
