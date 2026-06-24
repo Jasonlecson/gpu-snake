@@ -37,17 +37,16 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
     steps:
       - uses: actions/checkout@v4
-      - name: Setup MSYS2
+      - name: Install MSYS2 and build
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
+          release: true
           install: mingw-w64-x86_64-gcc mingw-w64-x86_64-opencl-icd-loader mingw-w64-x86_64-pdcurses
       - name: Build
+        shell: msys2 {0}
         run: gcc -O2 -o gpu_snake.exe gpu_snake.c -lOpenCL -lpdcurses
       - name: Upload artifact
         uses: actions/upload-artifact@v4
