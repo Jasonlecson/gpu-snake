@@ -8,12 +8,12 @@
 #ifdef _WIN32
   #include <windows.h>
   #include <conio.h>
+  #define USE_WINCONSOLE 1
 #else
   #include <unistd.h>
   #include <sys/ioctl.h>
+  #include <curses.h>
 #endif
-
-#include <curses.h>
 
 #ifdef __APPLE__
   #include <OpenCL/opencl.h>
@@ -22,8 +22,6 @@
 #endif
 
 #define FOOD_COUNT 10
-
-/* ======================== OpenCL kernel ======================== */
 
 static const char *KERNEL_SRC =
 "__kernel void snake_update(\n"
@@ -100,6 +98,122 @@ static void get_terminal_size(int *w, int *h) {
     if (*h < 10) *h = 10;
 }
 
+/* ======================== Windows Console API ======================== */
+
+#ifdef USE_WINCONSOLE
+
+static HANDLE hConsole;
+static HANDLE hConsoleIn;
+static COORD screenSize;
+static CHAR_INFO *screenBuf;
+static int console_w, console_h;
+
+static WORD attr_map(int color_pair, int bold) {
+    WORD a = 0;
+    switch (color_pair) {
+        case 1: a = FOREGROUND_GREEN; break;
+        case 2: a = FOREGROUND_RED; break;
+        case 3: a = FOREGROUND_RED | FOREGROUND_GREEN; break;
+        case 4: a = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE; break;
+        case 5: a = FOREGROUND_GREEN | FOREGROUND_BLUE; break;
+        case 6: a = FOREGROUND_RED | FOREGROUND_BLUE; break;
+        default: a = FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE; break;
+    }
+    if (bold) a |= FOREGROUND_INTENSITY;
+    return a;
+}
+
+static void console_init(void) {
+    hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    hConsoleIn = GetStdHandle(STD_INPUT_HANDLE);
+    SetConsoleOutputCP(65001);
+    CONSOLE_CURSOR_INFO ci = {1, FALSE};
+    SetConsoleCursorInfo(hConsole, &ci);
+    get_terminal_size(&console_w, &console_h);
+    screenBuf = malloc(console_w * console_h * sizeof(CHAR_INFO));
+}
+
+static void console_cleanup(void) {
+    free(screenBuf);
+    CONSOLE_CURSOR_INFO ci = {1, TRUE};
+    SetConsoleCursorInfo(hConsole, &ci);
+    system("cls");
+}
+
+static void console_clear(void) {
+    get_terminal_size(&console_w, &console_h);
+    screenBuf = realloc(screenBuf, console_w * console_h * sizeof(CHAR_INFO));
+    for (int i = 0; i < console_w * console_h; i++) {
+        screenBuf[i].Char.UnicodeChar = ' ';
+        screenBuf[i].Attributes = 0;
+    }
+}
+
+static void console_putchar(int y, int x, char ch, int color_pair, int bold) {
+    if (y < 0 || y >= console_h || x < 0 || x >= console_w) return;
+    int idx = y * console_w + x;
+    screenBuf[idx].Char.UnicodeChar = ch;
+    screenBuf[idx].Attributes = attr_map(color_pair, bold);
+}
+
+static void console_printstr(int y, int x, const char *s, int color_pair, int bold) {
+    WORD a = attr_map(color_pair, bold);
+    for (int i = 0; s[i] && x + i < console_w; i++) {
+        if (y < 0 || y >= console_h) continue;
+        int idx = y * console_w + x + i;
+        screenBuf[idx].Char.UnicodeChar = s[i];
+        screenBuf[idx].Attributes = a;
+    }
+}
+
+static void console_printf(int y, int x, int color_pair, int bold, const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    console_printstr(y, x, buf, color_pair, bold);
+}
+
+static void console_flush(void) {
+    COORD bufSize = {console_w, console_h};
+    COORD bufCoord = {0, 0};
+    SMALL_RECT writeRegion = {0, 0, console_w - 1, console_h - 1};
+    WriteConsoleOutputW(hConsole, screenBuf, bufSize, bufCoord, &writeRegion);
+}
+
+static int console_getch(void) {
+    INPUT_RECORD ir;
+    DWORD n;
+    while (1) {
+        if (!ReadConsoleInput(hConsoleIn, &ir, 1, &n)) continue;
+        if (ir.EventType != KEY_EVENT) continue;
+        if (!ir.Event.KeyEvent.bKeyDown) continue;
+        int vk = ir.Event.KeyEvent.wVirtualKeyCode;
+        switch (vk) {
+            case VK_UP:    return 256 + 1;
+            case VK_DOWN:  return 256 + 2;
+            case VK_LEFT:  return 256 + 3;
+            case VK_RIGHT: return 256 + 4;
+            default:
+                return ir.Event.KeyEvent.uChar.AsciiChar;
+        }
+    }
+}
+
+static int console_kbhit(void) {
+    INPUT_RECORD ir;
+    DWORD n;
+    while (PeekConsoleInput(hConsoleIn, &ir, 1, &n) && n > 0) {
+        if (ir.EventType == KEY_EVENT && ir.Event.KeyEvent.bKeyDown)
+            return 1;
+        ReadConsoleInput(hConsoleIn, &ir, 1, &n);
+    }
+    return 0;
+}
+
+#endif /* USE_WINCONSOLE */
+
 /* ======================== GPU context ======================== */
 
 typedef struct {
@@ -119,7 +233,9 @@ typedef struct {
 
 static void check_cl(cl_int err, const char *msg) {
     if (err != CL_SUCCESS) {
+#ifndef USE_WINCONSOLE
         endwin();
+#endif
         fprintf(stderr, "OpenCL error %d: %s\n", err, msg);
         exit(1);
     }
@@ -132,12 +248,10 @@ static gpu_ctx_t gpu_init(void) {
 
     err = clGetPlatformIDs(0, NULL, &num_platforms);
     if (err != CL_SUCCESS || num_platforms == 0) {
+#ifndef USE_WINCONSOLE
         endwin();
+#endif
         fprintf(stderr, "No OpenCL platforms found.\n");
-        fprintf(stderr, "Install an OpenCL runtime:\n");
-        fprintf(stderr, "  Linux:   sudo apt install mesa-opencl-icd (AMD/Intel) or nvidia-opencl-icd (NVIDIA)\n");
-        fprintf(stderr, "  macOS:   built-in (deprecated but functional)\n");
-        fprintf(stderr, "  Windows: install GPU driver (NVIDIA/AMD/Intel provides OpenCL)\n");
         exit(1);
     }
 
@@ -168,7 +282,9 @@ static gpu_ctx_t gpu_init(void) {
     free(platforms);
 
     if (!g.device) {
+#ifndef USE_WINCONSOLE
         endwin();
+#endif
         fprintf(stderr, "No OpenCL devices found\n");
         exit(1);
     }
@@ -196,7 +312,9 @@ static gpu_ctx_t gpu_init(void) {
         clGetProgramBuildInfo(g.prog, g.device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_sz);
         char *log = malloc(log_sz);
         clGetProgramBuildInfo(g.prog, g.device, CL_PROGRAM_BUILD_LOG, log_sz, log, NULL);
+#ifndef USE_WINCONSOLE
         endwin();
+#endif
         fprintf(stderr, "OpenCL build error:\n%s\n", log);
         free(log);
         exit(1);
@@ -278,25 +396,12 @@ static void init_game(int *grid, int *head, int *dir, int *len, int *status,
     }
 }
 
-static void print_line(int y, const char *s) {
-    mvaddstr(y, 0, s);
-}
-
-static void print_linef(int y, const char *fmt, ...) {
-    char buf[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    mvaddstr(y, 0, buf);
-}
-
 /* ======================== Main ======================== */
 
 int main(void) {
     srand((unsigned)time(NULL));
-
     setlocale(LC_ALL, "");
+
     gpu_ctx_t gpu = gpu_init();
     layout_t lay;
     calc_layout(&lay);
@@ -308,6 +413,13 @@ int main(void) {
     gpu_alloc(&gpu, gw, gh, grid);
     gpu_upload(&gpu, grid, head, dir, len, status, rng, gw, gh);
 
+#ifdef USE_WINCONSOLE
+    console_init();
+    int KEY_UP_CODE = 256 + 1;
+    int KEY_DOWN_CODE = 256 + 2;
+    int KEY_LEFT_CODE = 256 + 3;
+    int KEY_RIGHT_CODE = 256 + 4;
+#else
     initscr(); cbreak(); noecho(); curs_set(0);
     nodelay(stdscr, TRUE); timeout(80); keypad(stdscr, TRUE);
     start_color(); use_default_colors();
@@ -317,6 +429,7 @@ int main(void) {
     init_pair(4, COLOR_WHITE, -1);
     init_pair(5, COLOR_CYAN, -1);
     init_pair(6, COLOR_MAGENTA, -1);
+#endif
 
     double t_sum = 0;
     int fc = 0;
@@ -325,6 +438,16 @@ int main(void) {
     while (1) {
         double tf = now_us();
 
+#ifdef USE_WINCONSOLE
+        int ch = console_kbhit() ? console_getch() : -1;
+        if (ch == KEY_UP_CODE)    { if (dir[0] != 1) dir[0] = 0; }
+        else if (ch == KEY_DOWN_CODE)  { if (dir[0] != 0) dir[0] = 1; }
+        else if (ch == KEY_LEFT_CODE)  { if (dir[0] != 3) dir[0] = 2; }
+        else if (ch == KEY_RIGHT_CODE) { if (dir[0] != 2) dir[0] = 3; }
+        else if (ch == 'q' || ch == 'Q') goto quit;
+        else if (ch == 'r' || ch == 'R') goto restart;
+        Sleep(80);
+#else
         int ch = getch();
         switch (ch) {
             case KEY_UP:    if (dir[0] != 1) dir[0] = 0; break;
@@ -334,6 +457,7 @@ int main(void) {
             case 'q': goto quit;
             case 'r': goto restart;
         }
+#endif
 
         layout_t nl;
         calc_layout(&nl);
@@ -389,11 +513,59 @@ int main(void) {
         fc++;
         t_sum += t_kernel;
 
+        double elapsed = (now_us() - sess) / 1e6;
+        double fps = fc / elapsed;
+        double avg = t_sum / fc;
+        double frame_us = now_us() - tf;
+
+#ifdef USE_WINCONSOLE
+        console_clear();
+        console_printf(0, 0, 6, 1, " GPU SNAKE %dx%d=%d cells | %s %s %dCU@%dMHz ",
+                       gw, gh, gw * gh, gpu.platform_name, gpu.device_name,
+                       gpu.compute_units, gpu.clock_freq);
+
+        for (int y = 0; y < gh; y++) {
+            for (int x = 0; x < gw; x++) {
+                int v = grid[y * gw + x];
+                char c; int col, bld = 0;
+                if (y == head[0] && x == head[1]) { c = '@'; col = 3; bld = 1; }
+                else if (v == -1) { c = '*'; col = 2; bld = 1; }
+                else if (v > 0) { c = 'o'; col = 1; }
+                else { c = ' '; col = 0; }
+                console_putchar(y + 1, x + 1, c, col, bld);
+            }
+        }
+
+        int iy = lay.info_y;
+        console_printf(iy++, 0, 4, 1, " Score:%d  Length:%d  Frame:%d  Pos(%d,%d)  FPS:%.1f",
+                       len[0]-4, len[0], fc, head[1], head[0], fps);
+        iy++;
+        console_printf(iy++, 0, 5, 0, " -- GPU -----------------------------------------------------");
+        console_printf(iy++, 0, 5, 0, "  Platform:   %s", gpu.platform_name);
+        console_printf(iy++, 0, 5, 0, "  Device:     %s  (%s)", gpu.device_name, gpu.is_gpu ? "GPU" : "CPU");
+        console_printf(iy++, 0, 5, 0, "  CUs: %d  Freq: %d MHz  Grid: %dx%d  Threads: %d",
+                       gpu.compute_units, gpu.clock_freq, gw, gh, gw * gh);
+        iy++;
+        console_printf(iy++, 0, 5, 0, " -- Timing (avg %d frames) -----------------------------------", fc);
+        console_printf(iy++, 0, 5, 0, "  Kernel exec:  %8.1f us  (GPU hw: %7.1f us, queue: %7.1f us)",
+                       avg, gpu_k, gpu_q);
+        console_printf(iy++, 0, 5, 0, "  Result copy:  %8.1f us", t_rb);
+        console_printf(iy++, 0, 5, 0, "  Frame total:  %8.1f us  |  %.1f fps", frame_us, 1e6 / frame_us);
+        iy++;
+        console_printf(iy++, 0, 4, 0, " Arrows=move  q=quit  r=restart  |  Grid %dx%d on GPU", gw, gh);
+
+        if (status[0] == 2) {
+            console_printf(iy + 2, 0, 2, 1, " GAME OVER! ");
+            console_printf(iy + 3, 0, 4, 0, " r=restart  q=quit");
+        }
+
+        console_flush();
+#else
         erase();
         attron(A_BOLD | COLOR_PAIR(6));
-        print_linef(0, " GPU SNAKE %dx%d=%d cells | %s %s %dCU@%dMHz ",
-                    gw, gh, gw * gh,
-                    gpu.platform_name, gpu.device_name, gpu.compute_units, gpu.clock_freq);
+        mvprintw(0, 0, " GPU SNAKE %dx%d=%d cells | %s %s %dCU@%dMHz ",
+                 gw, gh, gw * gh, gpu.platform_name, gpu.device_name,
+                 gpu.compute_units, gpu.clock_freq);
         attroff(A_BOLD | COLOR_PAIR(6));
 
         for (int y = 0; y < gh; y++) {
@@ -401,58 +573,60 @@ int main(void) {
             for (int x = 0; x < gw; x++) {
                 int v = grid[y * gw + x];
                 int c, a;
-                if (y == head[0] && x == head[1]) {
-                    c = '@'; a = COLOR_PAIR(3) | A_BOLD;
-                } else if (v == -1) {
-                    c = '*'; a = COLOR_PAIR(2) | A_BOLD;
-                } else if (v > 0) {
-                    c = 'o'; a = COLOR_PAIR(1);
-                } else {
-                    c = ' '; a = 0;
-                }
+                if (y == head[0] && x == head[1]) { c = '@'; a = COLOR_PAIR(3) | A_BOLD; }
+                else if (v == -1) { c = '*'; a = COLOR_PAIR(2) | A_BOLD; }
+                else if (v > 0) { c = 'o'; a = COLOR_PAIR(1); }
+                else { c = ' '; a = 0; }
                 addch(c | a);
             }
         }
 
         int iy = lay.info_y;
-        double elapsed = (now_us() - sess) / 1e6;
-        double fps = fc / elapsed;
-        double avg = t_sum / fc;
-        double frame_us = now_us() - tf;
+        char buf[512];
 
         attron(COLOR_PAIR(4) | A_BOLD);
-        print_linef(iy++, " Score:%d  Length:%d  Frame:%d  Pos(%d,%d)  FPS:%.1f",
-                    len[0]-4, len[0], fc, head[1], head[0], fps);
+        snprintf(buf, sizeof(buf), " Score:%d  Length:%d  Frame:%d  Pos(%d,%d)  FPS:%.1f",
+                 len[0]-4, len[0], fc, head[1], head[0], fps);
+        mvaddstr(iy++, 0, buf);
         attroff(COLOR_PAIR(4) | A_BOLD);
 
         iy++;
         attron(COLOR_PAIR(5));
-        print_line(iy++, " -- GPU -----------------------------------------------------");
-        print_linef(iy++, "  Platform:   %s", gpu.platform_name);
-        print_linef(iy++, "  Device:     %s  (%s)", gpu.device_name, gpu.is_gpu ? "GPU" : "CPU");
-        print_linef(iy++, "  CUs: %d  Freq: %d MHz  Grid: %dx%d  Threads: %d",
-                    gpu.compute_units, gpu.clock_freq, gw, gh, gw * gh);
+        mvaddstr(iy++, 0, " -- GPU -----------------------------------------------------");
+        snprintf(buf, sizeof(buf), "  Platform:   %s", gpu.platform_name);
+        mvaddstr(iy++, 0, buf);
+        snprintf(buf, sizeof(buf), "  Device:     %s  (%s)", gpu.device_name, gpu.is_gpu ? "GPU" : "CPU");
+        mvaddstr(iy++, 0, buf);
+        snprintf(buf, sizeof(buf), "  CUs: %d  Freq: %d MHz  Grid: %dx%d  Threads: %d",
+                 gpu.compute_units, gpu.clock_freq, gw, gh, gw * gh);
+        mvaddstr(iy++, 0, buf);
         iy++;
-        print_linef(iy++, " -- Timing (avg %d frames) -----------------------------------", fc);
-        print_linef(iy++, "  Kernel exec:  %8.1f us  (GPU hw: %7.1f us, queue: %7.1f us)",
-                    avg, gpu_k, gpu_q);
-        print_linef(iy++, "  Result copy:  %8.1f us", t_rb);
-        print_linef(iy++, "  Frame total:  %8.1f us  |  %.1f fps", frame_us, 1e6 / frame_us);
+        snprintf(buf, sizeof(buf), " -- Timing (avg %d frames) -----------------------------------", fc);
+        mvaddstr(iy++, 0, buf);
+        snprintf(buf, sizeof(buf), "  Kernel exec:  %8.1f us  (GPU hw: %7.1f us, queue: %7.1f us)",
+                 avg, gpu_k, gpu_q);
+        mvaddstr(iy++, 0, buf);
+        snprintf(buf, sizeof(buf), "  Result copy:  %8.1f us", t_rb);
+        mvaddstr(iy++, 0, buf);
+        snprintf(buf, sizeof(buf), "  Frame total:  %8.1f us  |  %.1f fps", frame_us, 1e6 / frame_us);
+        mvaddstr(iy++, 0, buf);
         attroff(COLOR_PAIR(5));
 
         iy++;
         attron(COLOR_PAIR(4));
-        print_linef(iy++, " Arrows=move  q=quit  r=restart  |  Grid %dx%d on GPU", gw, gh);
+        snprintf(buf, sizeof(buf), " Arrows=move  q=quit  r=restart  |  Grid %dx%d on GPU", gw, gh);
+        mvaddstr(iy++, 0, buf);
         attroff(COLOR_PAIR(4));
 
         if (status[0] == 2) {
             attron(A_BOLD | COLOR_PAIR(2));
-            print_line(iy + 1, " GAME OVER! ");
+            mvaddstr(iy + 1, 0, " GAME OVER! ");
             attroff(A_BOLD | COLOR_PAIR(2));
-            print_line(iy + 2, " r=restart  q=quit");
+            mvaddstr(iy + 2, 0, " r=restart  q=quit");
         }
 
         refresh();
+#endif
         continue;
 
     restart:
@@ -464,7 +638,11 @@ int main(void) {
 
 quit:
     gpu_free(&gpu);
+#ifdef USE_WINCONSOLE
+    console_cleanup();
+#else
     endwin();
+#endif
     free(grid);
     printf("Device: %s %s\n", gpu.platform_name, gpu.device_name);
     printf("Grid: %dx%d, %d frames\n", gw, gh, fc);

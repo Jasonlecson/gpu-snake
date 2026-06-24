@@ -9,8 +9,8 @@ ifeq ($(UNAME_S),Linux)
 else ifeq ($(UNAME_S),Darwin)
   LDFLAGS = -framework OpenCL -lncurses -lm
 else
-  # Windows (MinGW/MSYS2)
-  LDFLAGS = -lOpenCL -lpdcurses -lm
+  # Windows (MinGW/MSYS2) - uses native Console API, no ncurses needed
+  LDFLAGS = -lOpenCL
 endif
 
 all: $(TARGET)
